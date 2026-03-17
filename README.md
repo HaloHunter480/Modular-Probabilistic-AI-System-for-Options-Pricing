@@ -6,7 +6,7 @@
 > When BTC moves on Binance, Polymarket's CLOB takes 2–5 seconds to reprice.  
 > The system estimates short-term fair value and attempts to exploit latency-driven mispricings.
 
-**Deployed on:** AWS EC2 eu-west-1 (Ireland) — ~140ms round-trip latency observed (AWS eu-west-1)
+**Deployed on:** AWS EC2 eu-west-1 (Ireland) — 140ms round-trip latency observed (AWS eu-west-1)
 **Language:** Python 3.12 · asyncio · fully event-driven
 
 ---
