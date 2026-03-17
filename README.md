@@ -1,216 +1,255 @@
+# Polymarket BTC 5-Min Latency-Arbitrage Bot
 
-# Polymarket BTC Latency-Arbitrage — Market-Taking Bot
+> **Market-taking system** that exploits stale quotes on Polymarket BTC binary options.  
+> When BTC moves on Binance, Polymarket's CLOB takes 2–5 seconds to reprice.  
+> We compute fair value faster and hit the stale side before it updates.
 
-A live, real-money trading system that exploits **stale quotes on Polymarket BTC 5-minute binary options** using a 6-layer probabilistic signal architecture, deployed on AWS eu-west-1 (Ireland, ~140ms to Polymarket CLOB).
+**Live confirmed order:** `0xdc9ff92dd273d60348ff0d53dfe6d040f92de07bec2cfce804dfd1189c252fba`  
+**Deployed on:** AWS EC2 eu-west-1 (Ireland) — ~140ms round-trip to Polymarket CLOB  
+**Language:** Python 3.12 · asyncio · fully event-driven
 
 ---
 
 ## The Edge
 
-Polymarket prices BTC UP/DOWN binary options over rolling 5-minute windows.  
-When BTC moves on Binance, Polymarket's CLOB takes **2–5 seconds** to reprice.  
-We compute a fair value **faster** than the repricing delay and buy the stale side:
-
 ```
-Edge = Φ(d₁)  −  poly_mid_stale
-  d₁ = (BTC_now − strike) / (σ_5m × √(T/300))
-  σ_5m calibrated live from Deribit implied volatility
-```
+Edge = fair_value(BTC_now, strike, T, σ) − poly_mid_stale
 
-Confirmed live `Status: matched` order on Polymarket:  
-`ID: 0xdc9ff92dd273d60348ff0d53dfe6d040f92de07bec2cfce804dfd1189c252fba`
+fair_value = Φ(d₁)        [Gaussian]
+           + P_merton(d₁)  [Merton jump-diffusion]   blended ⅓ each
+           + P_ml(X)       [ML ensemble: Logistic + HistGBM + XGBoost]
+
+d₁ = (BTC_now − strike) / (σ_5m × √(T/300))
+σ_5m live-calibrated from Deribit implied volatility
+```
 
 ---
 
-## Architecture — 6-Layer Signal Pipeline
+## 6-Layer Signal Architecture
 
 ```
-BTC price (Binance WS) ──┐
-Poly CLOB    (WS)        ├──► Layer 1: Data Feeds     (run_live.py)
-Deribit IV   (WS)        ┘         │
-Binance Depth (WS) ───────────────►│
-                                   ▼
-                         Layer 2: Fair Value Engine    (layer2_engine.py)
-                           Φ(d₁) + Deribit σ calibration
-                           OBI + cross-market arb + oracle-lag
-                                   │
-                                   ▼
-                         Layer 3: Stale-Quote Gate     (decision_stack.py)
-                           poly_mid unchanged in last 1s → still stale
-                                   │
-                                   ▼
-                         Layer 4: Merton Jump-Diffusion (layer4_merton_jump.py)
-                           P(S_T>K) with Poisson jump component
-                           blended 50/50 with Layer 2
-                                   │
-                                   ▼
-                         Layer 5: HMM Regime Classifier (layer5_hmm_regime.py)
-                           3 states: low_vol / medium_vol / high_vol
-                           Viterbi decoding → adaptive edge threshold
-                                   │
-                                   ▼
-                         Layer 6: Kelly Sizing + Risk   (layer6_risk_execution.py)
-                           f* = (p·b − q)/b × vol_mult × hawkes_mult
-                           FOK market order via EIP-712 (live_executor.py)
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 1 — Data Feeds                         run_live.py       │
+│  Binance trades WS · Binance depth WS                           │
+│  Polymarket CLOB WS · Deribit IV WS                             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 2 — Fair Value Engine                  layer2_engine.py  │
+│  Φ(d₁) Gaussian binary · OBI signal                            │
+│  Cross-market arb (UP+DN=1) · Oracle-lag detector              │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 3 — Stale Quote Gate                   decision_stack.py │
+│  poly_mid unchanged ≥ 1s → still stale → trade allowed         │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 4 — Merton Jump-Diffusion              layer4_merton_jump.py │
+│  P(S_T>K) = Σ Poisson(n;λT) × BS_binary(σ_n)                   │
+│  Blended ⅓ with Gaussian fair value                             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 5 — HMM Regime Classifier              layer5_hmm_regime.py │
+│  3 states: low_vol / medium_vol / high_vol                      │
+│  Viterbi decoding → adaptive edge threshold (2% / 3% / 5%)     │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  LAYER 6 — Kelly Sizing + Execution           layer6_risk_execution.py │
+│  f* = (p·b − q)/b × vol_mult × hawkes_mult × vpin_mult         │
+│  EIP-712 signed FOK market order → Polymarket CLOB              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## ML Ensemble (Third Fair-Value Signal)
+
+Trained on **BTC/USDT 1-second Level-2 order book data** (1.6 GB, ~2.6M rows).  
+Three models calibrated with isotonic regression, blended by weighted average:
+
+```
+P_ml = 0.4 × LogisticRegression(C=0.1, L2)
+     + 0.3 × HistGradientBoosting(max_depth=6, lr=0.05, l2=0.1, early_stop)
+     + 0.3 × XGBoost(n=300, max_depth=6, α=0.1, λ=1.0)
+```
+
+**Loss:** Binary cross-entropy minimised on each sub-model independently.  
+**Calibration:** `CalibratedClassifierCV(method="isotonic", cv="prefit")` on 15% val set.  
+**Test metrics:** Accuracy 54.2% · Brier 0.2491 · ECE 0.0312
+
+**13 input features:**
+
+| Feature | Description |
+|---------|-------------|
+| `ret_1s / 10s / 30s / 60s / 120s` | Multi-horizon BTC momentum (%) |
+| `realized_vol_10s / 30s / 60s / 120s` | Rolling realized volatility (%) |
+| `ofi` | Order Flow Imbalance = (buys − sells) / total |
+| `spread_pct` | Bid-ask spread as % of mid |
+| `dist_strike` | (BTC − strike) / strike × 100 |
+| `time_to_expiry` | Seconds remaining in 5-min window |
+
+**Target:** `Y = 1 if BTC_close[t+300s] > strike else 0`
+
+---
+
+## Decision Stack — 8 Gates (`decision_stack.py`)
+
+```
+Gate 1  btc_flat          |Δbtc_10s| ≥ 0.015%  OR  |drift_from_strike| ≥ 0.015%
+Gate 2  stale_check       poly_mid unchanged in last 1.0s → quote still stale
+Gate 3  price_zone        0.20 ≤ p_mkt ≤ 0.80  (near-resolved = no liquidity)
+Gate 4  extreme_vol       GARCH vol_regime ≠ EXTREME_VOL
+Gate 5  vpin_toxic        VPIN < 0.55  (no informed-flow regime)
+Gate 6  hawkes_regime     regime ∈ {QUIET, ACTIVE, EXCITED, EXPLOSIVE}
+Gate 7  obi_gate          Polymarket OBI not strongly opposing direction
+Gate 8  gap_threshold     edge_net ≥ edge_threshold[hmm_regime]
+```
+
+All 8 gates must pass. On `TRADE`: Kelly-sized FOK order submitted via EIP-712.
+
+---
+
+## Supporting Quant Models
+
+**Hawkes Process** (`Hawkes_Process.py`) — trade-arrival intensity:
+```
+λ(t) = μ + Σ_{t_i < t} α · exp(−β · (t − t_i))
+Regimes: QUIET · ACTIVE · EXCITED (α/β > 0.5) · EXPLOSIVE (α/β → 1)
+MLE fitted on live trade timestamps; refit hourly
+```
+
+**GARCH(1,1)** (`garch.py`) — realized volatility:
+```
+σ²_t = ω + α·ε²_{t-1} + β·σ²_{t-1}
+Regimes: LOW_VOL · NORMAL_VOL · HIGH_VOL · EXTREME_VOL
+```
+
+**VPIN** (`vpin.py`) — toxic flow detection:
+```
+VPIN = |V_buy − V_sell| / V_total   (volume-bucket estimate)
+Threshold 0.55 → informed-flow regime → halt trading
 ```
 
 ---
 
 ## File Map
 
-| File | Role | Lines |
-|------|------|-------|
-| `run_live.py` | **Main entry point** — asyncio event loop, all feed tasks, eval loop at 10 Hz | 1335 |
-| `decision_stack.py` | **8-gate trading pipeline** — all veto logic, fair value, gate chain | 465 |
-| `live_executor.py` | **Order execution** — EIP-712 signing, `post_order(FOK)`, risk manager | 834 |
-| `layer2_engine.py` | Layer 2 — Gaussian fair value, OBI, cross-market arb, oracle lag | 282 |
-| `layer4_merton_jump.py` | Layer 4 — Merton jump-diffusion model | 216 |
-| `layer5_hmm_regime.py` | Layer 5 — HMM volatility regime classifier | 278 |
-| `layer6_risk_execution.py` | Layer 6 — Kelly sizing, position limits, execution rules | 111 |
-| `Hawkes_Process.py` | Self-exciting point process for trade-arrival intensity | 126 |
-| `garch.py` | GARCH(1,1) realized volatility estimator | 115 |
-| `vpin.py` | VPIN — Volume-Synchronized Probability of Informed Trading | 123 |
-| `orderbook.py` | Order-book imbalance tracker (Binance + Polymarket) | — |
-| `triple_streams.py` | Layer 1–6 integration test harness | — |
-| `train_hmm_regime.py` | HMM training on 8-year Kaggle BTC data | — |
-| `warmup.py` | Cold-start GARCH + Hawkes from recent live data | — |
-| `backtest_300.py` | Strategy backtester on 1-second BTC tick data | — |
+### Live Trading
+| File | Purpose | Lines |
+|------|---------|-------|
+| `run_live.py` | Main bot — asyncio loop, 4 WS feeds, 10 Hz eval, auto market-refresh | 1335 |
+| `decision_stack.py` | 8-gate pipeline, all three fair-value signals, veto logic | 561 |
+| `live_executor.py` | EIP-712 signing, `post_order(FOK)`, token cache, RiskManager | 834 |
+
+### Layers 1–6
+| File | Layer | Purpose |
+|------|-------|---------|
+| `triple_streams.py` | 1–6 | Integration test harness |
+| `layer2_engine.py` | 2 | Gaussian fair value, OBI, cross-market arb, oracle-lag |
+| `layer3_empirical_conditional.py` | 3 | Empirical P(UP\|Δ,T,regime) — kernel-smoothed |
+| `layer4_merton_jump.py` | 4 | Merton jump-diffusion |
+| `layer5_hmm_regime.py` | 5 | GaussianHMM regime classifier, Viterbi |
+| `layer6_risk_execution.py` | 6 | Kelly fraction, position limits |
+
+### ML Training
+| File | Purpose |
+|------|---------|
+| `train_probability_model.py` | Train Logistic + HistGBM + XGBoost ensemble → `models/probability_model.pkl` |
+| `train_hmm_regime.py` | Train GaussianHMM on Kaggle 8yr data → `models/hmm_regime.pkl` |
+| `kaggle.py` | Download `shivaverse/btcusdt-5-minute-ohlc-volume-data-2017-2025` |
+| `download_btc_1s.py` | Download Binance 1s klines from `data.binance.vision` |
+| `warmup.py` | Cold-start GARCH + Hawkes from recent live ticks |
+| `backtest_300.py` | Full strategy backtester on 1s tick data |
+
+### Quant Models
+| File | Purpose |
+|------|---------|
+| `Hawkes_Process.py` | Self-exciting point process |
+| `garch.py` | GARCH(1,1) vol + regime labels |
+| `vpin.py` | VPIN toxic flow detector |
+| `orderbook.py` | Level-2 OBI tracker |
+| `kalman_filter.py` | Kalman filter for price smoothing |
+| `empirical_model.py` | Empirical conditional P(UP) surface |
 
 ---
 
-## Mathematical Models
+## Live Results
 
-### Layer 2 — Gaussian Binary Option
+| Window (ET) | Side | Entry | Edge | Result | P&L |
+|-------------|------|-------|------|--------|-----|
+| 10:20–10:25 | DOWN | 0.570 | +15.3% | **WIN** | +$1.29 |
+| 10:30–10:35 | DOWN | 0.740 | +7.6% | **WIN** | +$0.34 |
+| 10:55–11:00 | DOWN | 0.570 | +13.8% | matched | — |
 
-```python
-# layer2_engine.py  _compute_fair_value()
-pct_diff = (BTC_now - strike) / strike * 100
-sigma_5m  = max(deribit_iv * 0.01, SIGMA_FLOOR_PCT)   # Deribit IV → 5-min σ
-sigma_t   = sigma_5m * sqrt(time_remaining / 300)
-d         = pct_diff / sigma_t
-fair_up   = Φ(d)     # scipy.special.ndtr  or  math.erf(d/√2)/2 + 0.5
-```
-
-### Layer 4 — Merton Jump-Diffusion
-
-```python
-# layer4_merton_jump.py
-# P(S_T > K) = Σ_{n=0}^{N}  Poisson(n; λT) × BS_call(σ_n)
-# σ_n² = σ_diff² + n·σ_jump²/T
-# λ, μ_jump, σ_jump estimated from 8-yr BTC 1-min returns (Kaggle)
-p_up_merton = sum(
-    poisson.pmf(n, lam*T) * black_scholes_binary(S, K, T, sigma_n)
-    for n in range(N_max)
-)
-# Final signal: blend L2 + L4
-fair_up = 0.5 * fair_value_gaussian + 0.5 * p_up_merton
-```
-
-### Layer 5 — HMM Regime Classifier
-
-```python
-# layer5_hmm_regime.py  (trained in train_hmm_regime.py)
-# 3 states: low_vol, medium_vol, high_vol
-# Emission:  N(μ_k, σ_k²) on 30-second BTC log-returns
-# Transition: learned A matrix via Baum-Welch on 8yr data
-# Inference:  Viterbi decoding for MAP state sequence
-regime = hmm_model.predict(recent_returns[-20:])  # hmmlearn GaussianHMM
-edge_threshold = {"high_vol": 0.05, "medium_vol": 0.03, "low_vol": 0.02}[regime]
-```
-
-### Layer 6 — Kelly Fraction + Sizing
-
-```python
-# layer6_risk_execution.py
-b = 1.0 / entry_price - 1.0          # net odds (bet $p, win $1)
-f_star = (p_model * b - (1 - p_model)) / b   # Kelly fraction
-size_usd = bankroll * f_star
-           * vol_regime_mult          # 1.2x LOW_VOL, 0.6x HIGH_VOL
-           * hawkes_mult              # 1.2x EXCITED, 0.5x QUIET
-           * vpin_mult                # 1 - 0.5*(vpin/vpin_max)
-size_usd = max(size_usd, MIN_TRADE_USD)       # Polymarket $1 floor
-size_usd = min(size_usd, bankroll * MAX_PCT)  # 10% bankroll cap
-```
-
-### Decision Stack — 8 Gates (decision_stack.py)
-
-```
-Gate 1  btc_flat        |Δbtc_10s| ≥ 0.015%  OR  |drift_from_strike| ≥ 0.015%
-Gate 2  stale_check     poly_mid unchanged ≥ 1s  → quote still stale
-Gate 3  price_zone      0.20 ≤ p_mkt ≤ 0.80  (near-resolved = no liquidity)
-Gate 4  extreme_vol     GARCH vol_regime ≠ EXTREME_VOL
-Gate 5  vpin_toxic      VPIN < 0.55  (no informed-flow regime)
-Gate 6  hawkes_regime   regime ∈ {QUIET, ACTIVE, EXCITED, EXPLOSIVE}
-Gate 7  obi_gate        Polymarket OBI not strongly opposing direction
-Gate 8  gap_threshold   edge_net ≥ edge_threshold[hmm_regime]
-```
-
-### Supporting Models
-
-**Hawkes Process** (`Hawkes_Process.py`)
-```
-λ(t) = μ + Σ_{t_i < t} α·exp(−β·(t − t_i))
-Regimes: QUIET (λ≈μ), ACTIVE, EXCITED (α/β>0.5), EXPLOSIVE (α/β→1)
-Fitted by MLE on live trade timestamps; refit hourly
-```
-
-**GARCH(1,1)** (`garch.py`)
-```
-σ²_t = ω + α·ε²_{t-1} + β·σ²_{t-1}
-Vol regimes: LOW_VOL (σ<0.1%), NORMAL_VOL, HIGH_VOL, EXTREME_VOL
-```
-
-**VPIN** (`vpin.py`)
-```
-VPIN = |V_buy - V_sell| / V_total   (volume-bucket estimate)
-Toxic flow threshold: VPIN > 0.55 → halt (informed traders dominating)
-```
-
----
-
-## Live Results (2026-03-15, Mac → Polymarket direct)
-
-| Window | Side | Entry | Edge | Result | P&L |
-|--------|------|-------|------|--------|-----|
-| 10:20–10:25 ET | DOWN | 0.570 | +15.3% | **WIN** | +$1.29 |
-| 10:30–10:35 ET | DOWN | 0.740 | +7.6%  | **WIN** | +$0.34 |
-| 10:55–11:00 ET | DOWN | 0.570 | +13.8% | matched | — |
-
-Balance: $20.00 → $20.68 after 2 resolved trades.
+**Balance:** $20.00 → $20.68 after 2 resolved trades.
 
 ---
 
 ## Setup & Run
 
 ```bash
+# 1. Install dependencies
 pip install -r requirements.txt
 
-# 1. Train HMM regime model (once, on historical data)
-python3 train_hmm_regime.py
+# 2. Set up credentials
+cp .env.example .env
+# Edit .env with your Polymarket private key + API key
 
-# 2. Warm up GARCH + Hawkes from recent ticks
+# 3. Download training data
+python3 kaggle.py                            # 5-min OHLCV (for HMM)
+python3 download_btc_1s.py --days 30 --merge # 1s klines (for ML ensemble)
+# OR place BTC_1sec.csv (L2 order book) in project root — see data/README.md
+
+# 4. Train models
+python3 train_hmm_regime.py --data btc_1sec.csv
+python3 train_probability_model.py --data btc_1sec.csv
 python3 warmup.py
 
-# 3. Paper mode (no real money)
+# 5. Paper mode (no real money)
 python3 run_live.py --bankroll 20 --binance
 
-# 4. Live mode
+# 6. Live mode
 python3 run_live.py --live --bankroll 20 --binance
+
+# 7. Integration test (runs all 6 layers live for 60s)
+python3 triple_streams.py --layer2 --duration 60 --discover
 ```
 
-**Environment:** Python 3.12, asyncio — runs on macOS or Ubuntu 22.04 (AWS eu-west-1).
+**Requirements:** Python 3.12 · macOS or Ubuntu 22.04 · AWS EC2 eu-west-1 recommended
 
 ---
 
 ## Tech Stack
 
-| Component | Library |
-|-----------|---------|
+| Component | Library / Service |
+|-----------|------------------|
 | Async I/O | `asyncio`, `aiohttp`, `websockets` |
 | Order signing | `py-clob-client` (EIP-712), `eth-account` |
-| Statistics | `scipy.special.ndtr`, `scipy.stats` |
+| ML ensemble | `scikit-learn`, `xgboost` |
 | HMM | `hmmlearn.GaussianHMM` |
+| Statistics | `scipy.special.ndtr`, `scipy.stats` |
 | Numerics | `numpy` |
-| Env / secrets | `python-dotenv` |
-| Data feeds | Binance WS, Polymarket CLOB WS, Deribit WS |
-| Deployment | AWS EC2 eu-west-1 (t3.micro) |
+| Data feeds | Binance WS · Polymarket CLOB WS · Deribit WS |
+| Deployment | AWS EC2 eu-west-1 t3.micro |
+| Secrets | `python-dotenv` |
+
+---
+
+## Key Commits
+
+| SHA | Description |
+|-----|-------------|
+| `1f1b326` | feat: ML ensemble (Logistic + HistGBM + XGBoost) as third fair-value signal |
+| `898af19` | perf: AWS Ireland gate tuning — MIN_BTC_MOVE_PCT, Hawkes, STRIKE_LOCK_S |
+| `8550637` | fix: market order submission — `post_order(FOK)` after local EIP-712 signing |
+| `5a5f025` | feat: Polymarket BTC 5-min latency-arbitrage bot Layer 1-6 initial build |
+
+---
+
+## License
+
+MIT — see `LICENSE`
