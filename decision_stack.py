@@ -62,8 +62,8 @@ REGIME_MODE_WINDOW = 20  # mode of last N predictions for persistence
 CONF_P_MIN          = 0.20    # Polymarket price zone: 20-80 cts (wider on low-latency AWS)
 CONF_P_MAX          = 0.80    # (binary near 0/1 has no liquidity)
 
-MIN_BTC_MOVE_PCT    = 0.015   # BTC must have moved ≥ 0.015% to create a gap
-                               # (lowered — move_mult now scales UP from threshold)
+MIN_BTC_MOVE_PCT    = 0.04    # BTC must have moved ≥ 0.04% to create a gap
+                               # (move_mult scales UP from this threshold)
 SIGMA_FLOOR_PCT     = 0.07    # minimum σ in % (empirical LOW_VOL σ = 0.073%)
 SIGMA_SCALE_PCT     = 0.24    # baseline 5-min σ (from 8yr Kaggle data)
 
