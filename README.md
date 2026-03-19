@@ -5,6 +5,7 @@
 > **Market-taking system** that exploits stale quotes on Polymarket BTC binary options.  
 > When BTC moves on Binance, Polymarket's CLOB takes 2–5 seconds to reprice.  
 > The system estimates short-term fair value and attempts to exploit latency-driven mispricings.
+
 **The core** is the exact 6-layer probabilistic pipeline:
 
 - Layer 3: XGBoost ensemble for conditional probability estimates  
