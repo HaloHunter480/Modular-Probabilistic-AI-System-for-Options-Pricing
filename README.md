@@ -1,4 +1,4 @@
-# Latency Arbitrage Engine for Prediction Markets
+# Modular Probabilistic System for Options Pricing in Cryptocurrency Markets 
 
 ⚠️ Research/educational project. Not financial advice or production-ready trading system.
 
