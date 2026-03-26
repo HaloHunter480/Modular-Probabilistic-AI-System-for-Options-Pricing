@@ -1,4 +1,4 @@
-# Modular Probabilistic System for Options Pricing in Cryptocurrency Markets 
+# Modular Probabilistic AI System for Options Pricing in Cryptocurrency Markets 
 
 ⚠️ Research/educational project. Not financial advice or production-ready trading system.
 
