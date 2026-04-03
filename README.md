@@ -1,6 +1,6 @@
-# Modular Probabilistic AI System for Options Pricing in Cryptocurrency Markets 
+# Modular Probabilistic AI System for Options Pricing 
 
-⚠️ Research/educational project. Not financial advice or production-ready trading system.
+~ Research/educational project. Not financial advice or production-ready trading system.
 
 > **Market-taking system** that exploits stale quotes on Polymarket BTC binary options.  
 > When BTC moves on Binance, Polymarket's CLOB takes 2–5 seconds to reprice.  
